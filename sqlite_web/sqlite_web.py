@@ -85,6 +85,15 @@ except ImportError:
         Result, is_read, key_decode, key_encode, run_one, run_script,
         split_statements, wrap)
 
+try:
+    from sqlite_web.copy_records import (
+        CopyError, check_no_triggers, copy_referenced_records,
+        load_table_schema, parse_keys)
+except ImportError:
+    from copy_records import (
+        CopyError, check_no_triggers, copy_referenced_records,
+        load_table_schema, parse_keys)
+
 
 CUR_DIR = os.path.realpath(os.path.dirname(__file__))
 DEBUG = False
@@ -902,7 +911,10 @@ def table_content(table):
 
     if request.method == 'POST':
         action = request.form.get('action')
-        values = _bulk_delete_values(request.form.getlist('pk'))
+        tokens = request.form.getlist('pk')
+        values = _bulk_delete_values(tokens)
+        if action == 'copy-selected':
+            return _copy_selected(table, tokens)
         if not allow_bulk:
             flash('Cannot perform bulk operation on this table.', 'warning')
         elif action != 'bulk-delete':
@@ -968,12 +980,21 @@ def table_content(table):
     result = Result('rows', columns=columns, rows=rows, keys=keys)
 
     fk_lookup = dataset.cached_fk_lookup(table)
+    # Only single-column integer-keyed tables can take part in a copy; other
+    # selections fall through to bulk delete where that applies.
+    copyable = allow_bulk and any(
+        column.primary_key and (column.data_type or '').upper() == 'INTEGER'
+        for column in dataset.get_columns(table))
+    copy_targets = OrderedDict(
+        (name, ds) for name, ds in sorted(datasets.items())
+        if ds.filename != dataset.filename) if copyable else {}
 
     return render_template(
         'table_content.html',
         allow_bulk=allow_bulk,
         allow_detail=allow_detail,
         allow_edit=allow_edit,
+        copy_targets=copy_targets,
         fk_lookup=fk_lookup,
         next_page=next_page,
         ordering=ordering,
@@ -984,6 +1005,32 @@ def table_content(table):
         table_sql=dataset.cached_table_sql(table),
         total_pages=total_pages,
         total_rows=total_rows)
+
+def _copy_selected(table, tokens):
+    """Send a content-page selection to the copy page for confirmation.
+
+    The rows stay here as the source; ``target`` names the database the
+    selection should be copied into.  The form sends the same encoded row
+    keys the bulk delete uses.
+    """
+    target = request.form.get('target') or ''
+    if target not in datasets:
+        flash('Select a target database.', 'warning')
+        return redirect(request.full_path)
+    if target == get_dataset().filename:
+        flash('Select a database other than the current one.', 'warning')
+        return redirect(request.full_path)
+    values = _bulk_delete_values(tokens)
+    if not values:
+        flash('No rows were selected.', 'warning')
+        return redirect(request.full_path)
+    if not all(isinstance(value, int) and not isinstance(value, bool)
+               for value in values):
+        flash('Copy requires integer primary keys.', 'warning')
+        return redirect(request.full_path)
+    return redirect(url_for(
+        'table_copy', table=table, source=get_dataset().filename,
+        target=target, keys=','.join(str(value) for value in values)))
 
 def _blank_means_null(field):
     # Whitelist of types that cannot hold an empty string. Anything
@@ -1409,6 +1456,203 @@ def db_download():
     response.headers['Content-Disposition'] = 'attachment; filename="%s"' % (
         filename)
     return response
+
+@app.route('/<table>/copy/', methods=['GET', 'POST'])
+@require_table
+def table_copy(table):
+    """Copy rows and the records they reference between loaded databases.
+
+    The selected dataset is the target by default; the form can name either
+    side explicitly.  A content-page bulk selection posts ``pk`` tokens and a
+    ``target``, which makes the selected dataset the source.  The batch is
+    atomic, existing target rows are never overwritten, referenced records
+    are copied automatically and the source database is only read.
+    """
+    return _copy_view(table)
+
+
+def _copy_view(table):
+    current = get_dataset()
+    source_key = request.values.get('source') or ''
+    target_key = request.values.get('target') or ''
+
+    # The copy page is opened on the target's own table tab.  A selection
+    # made on a content page inverts that: the visible database is the
+    # source and the form names the target.
+    target = datasets.get(target_key) or current
+    sources = OrderedDict(
+        (name, ds) for name, ds in sorted(datasets.items())
+        if ds.filename != target.filename)
+    if source_key:
+        source = datasets.get(source_key)
+        if source is not None and source.filename == target.filename:
+            source = None
+    else:
+        source = current if current.filename != target.filename else None
+    if source is None and sources:
+        source = next(iter(sources.values()))
+
+    # Only the text field prefills from a URL; a POST may carry a checkbox
+    # list under the same name, where the first entry is not the whole
+    # selection.
+    keys_text = request.values.get('keys_text') or ''
+    if not keys_text and request.method == 'GET':
+        keys_text = request.values.get('keys') or ''
+    selected_keys = None
+    if keys_text:
+        try:
+            selected_keys = set(parse_keys(keys_text))
+        except CopyError:
+            # The copy attempt itself reports the invalid selection.
+            selected_keys = None
+    result = None
+    error = None
+    if request.method == 'POST':
+        try:
+            if target.is_readonly:
+                raise CopyError('the target database is read-only')
+            if source is None:
+                raise CopyError('select a source database')
+            if source.filename == target.filename:
+                raise CopyError(
+                    'source and target databases must be different')
+            if not table:
+                raise CopyError('select a table to copy')
+            keys = parse_keys(
+                list(request.form.getlist('keys')) +
+                list(request.form.getlist('pk')) +
+                [request.form.get('keys_text') or ''])
+            result = copy_referenced_records(source, target, table, keys)
+        except CopyError as exc:
+            error = str(exc)
+        except Exception as exc:
+            app.logger.exception('Error copying rows into %s.', table)
+            error = 'Unexpected error: %s' % exc
+        else:
+            flash('Copied %s record(s) from %s into %s.' % (
+                result.total, source.short_path, target.short_path),
+                'success')
+            if request.values.get('format') == 'json':
+                payload = result.to_dict()
+                _close_other_datasets((source, target), current)
+                return jsonify(payload)
+            # Redirect after the write so a refresh cannot copy twice.  The
+            # result is parked server-side: a big key mapping does not fit in
+            # a session cookie.
+            token = _store_copy_result(result, target.filename, table)
+            _close_other_datasets((source, target), current)
+            return redirect(url_for(
+                'table_copy', table=table, source=source.filename,
+                target=target.filename, result=token))
+
+    if request.values.get('format') == 'json':
+        if error:
+            _close_other_datasets((source, target), current)
+            return jsonify({'error': error}), 400
+        payload = {'table': table, 'source': source.filename if source
+                   else None, 'target': target.filename,
+                   'sources': list(sources)}
+        _close_other_datasets((source, target), current)
+        return jsonify(payload)
+
+    stored = _peek_copy_result(request.values.get('result'))
+    if stored is not None:
+        stored_result, stored_target, stored_table = stored
+        if stored_target == target.filename and stored_table == table:
+            result = stored_result
+
+    source_rows = _copy_choice_rows(source, table) if source else None
+    page = render_template(
+        'table_copy.html',
+        error=error,
+        keys_text=keys_text,
+        result=result,
+        selected_keys=selected_keys,
+        source=source,
+        source_rows=source_rows,
+        sources=sources,
+        table=table,
+        target=target)
+    # Only the session's dataset is closed by teardown.  A page that read a
+    # different database must not leave that connection open.
+    _close_other_datasets((source, target), current)
+    return page
+
+
+_COPY_RESULTS = {}
+_COPY_RESULTS_LOCK = threading.Lock()
+_COPY_RESULT_TTL = 3600
+_COPY_RESULT_LIMIT = 16
+
+
+def _store_copy_result(result, target, table):
+    """Park a copy result for the redirect that follows the write.
+
+    A key mapping is unbounded, so it cannot ride in the session cookie.
+    Entries are short-lived and capped; a reload still finds its result
+    because the token stays in the URL.
+    """
+    token = hashlib.sha256(os.urandom(32)).hexdigest()[:32]
+    now = time.time()
+    with _COPY_RESULTS_LOCK:
+        for key, (created, _, _, _) in list(_COPY_RESULTS.items()):
+            if now - created > _COPY_RESULT_TTL:
+                del _COPY_RESULTS[key]
+        while len(_COPY_RESULTS) >= _COPY_RESULT_LIMIT:
+            oldest = min(_COPY_RESULTS, key=lambda k: _COPY_RESULTS[k][0])
+            del _COPY_RESULTS[oldest]
+        _COPY_RESULTS[token] = (now, result, target, table)
+    return token
+
+
+def _peek_copy_result(token):
+    if not token:
+        return None
+    with _COPY_RESULTS_LOCK:
+        entry = _COPY_RESULTS.get(token)
+        if entry is None:
+            return None
+        created, result, target, table = entry
+        if time.time() - created > _COPY_RESULT_TTL:
+            del _COPY_RESULTS[token]
+            return None
+        return result, target, table
+
+
+def _close_other_datasets(candidates, current):
+    for dataset in candidates:
+        if dataset is not None and dataset is not current and \
+                not dataset._database.is_closed():
+            dataset.close()
+
+
+def _copy_choice_rows(dataset, table, limit=500):
+    """A capped, read-only listing used by the copy page's checkboxes."""
+    try:
+        schema = load_table_schema(dataset, table)
+        check_no_triggers(dataset, schema.name, 'source')
+        columns = [column.name for column in schema.columns]
+        cursor = dataset.query(
+            'SELECT %s FROM %s ORDER BY %s LIMIT ?' % (
+                ', '.join(quote_ident(name) for name in columns),
+                quote_ident(schema.name),
+                quote_ident(schema.primary_key.name)), (limit,))
+        try:
+            rows = cursor.fetchall()
+        finally:
+            cursor.close()
+        total = dataset.query(
+            'SELECT COUNT(*) FROM %s' % quote_ident(schema.name)).fetchone()[0]
+    except Exception as exc:
+        return {'error': str(exc)}
+    return {
+        'columns': columns,
+        'pk_index': columns.index(schema.primary_key.name),
+        'rows': rows,
+        'total': total,
+        'limit': limit,
+        'truncated': total > len(rows),
+    }
 
 @app.route('/<table>/import/', methods=['GET', 'POST'])
 @require_table

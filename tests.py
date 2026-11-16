@@ -1,4 +1,5 @@
 import os
+import re
 import shutil
 import sqlite3
 import tempfile
@@ -8,6 +9,9 @@ from peewee import SqliteDatabase
 from playhouse.dataset import DataSet
 
 from sqlite_web import sqlite_web as sw
+from sqlite_web.copy_records import CopyError
+from sqlite_web.copy_records import copy_referenced_records
+from sqlite_web.copy_records import parse_keys
 from sqlite_web.executor import Result
 from sqlite_web.executor import is_read
 from sqlite_web.executor import key_decode
@@ -988,6 +992,352 @@ class TestUrlPrefix(BaseAppTestCase):
     def test_session_cookie_scoped_to_prefix(self):
         r = self.client.get('/sqlite/users/content/')
         self.assertIn('Path=/sqlite', r.headers['Set-Cookie'])
+
+
+class BaseCopyTestCase(unittest.TestCase):
+    SOURCE_SCHEMA = """
+        CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT);
+        CREATE TABLE orders (id INTEGER PRIMARY KEY,
+            customer_id INTEGER REFERENCES customers, code TEXT);
+        CREATE TABLE items (id INTEGER PRIMARY KEY,
+            order_id INTEGER REFERENCES orders, sku TEXT);
+        INSERT INTO customers (id, name) VALUES (10, 'acme'), (11, 'beta');
+        INSERT INTO orders (id, customer_id, code) VALUES
+            (100, 10, 'A'), (101, 11, 'B'), (102, 10, 'C'), (103, NULL, 'N');
+        INSERT INTO items (id, order_id, sku) VALUES
+            (1, 100, 'x'), (2, 100, 'y'), (3, 101, 'z');
+    """
+    TARGET_SCHEMA = """
+        CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT);
+        CREATE TABLE orders (id INTEGER PRIMARY KEY,
+            customer_id INTEGER REFERENCES customers, code TEXT);
+        CREATE TABLE items (id INTEGER PRIMARY KEY,
+            order_id INTEGER REFERENCES orders, sku TEXT);
+        INSERT INTO customers (id, name) VALUES (1, 'existing');
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.src_path = os.path.join(self.tmp, 'src.db')
+        self.tgt_path = os.path.join(self.tmp, 'tgt.db')
+        self._schema(self.src_path, self.SOURCE_SCHEMA)
+        self._schema(self.tgt_path, self.TARGET_SCHEMA)
+        self.source = DataSet(SqliteDatabase(self.src_path))
+        self.target = DataSet(SqliteDatabase(self.tgt_path))
+        sw.datasets.clear()
+        sw.initialize_app([self.tgt_path, self.src_path])
+        sw.app.config['TESTING'] = True
+        self.client = sw.app.test_client()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _schema(self, path, schema):
+        if os.path.exists(path):
+            os.unlink(path)
+        conn = sqlite3.connect(path)
+        conn.executescript(schema)
+        conn.commit()
+        conn.close()
+
+    def rebuild(self, which, schema):
+        """Close the dataset connection before replacing its file."""
+        dataset = self.source if which == 'source' else self.target
+        path = self.src_path if which == 'source' else self.tgt_path
+        if not dataset._database.is_closed():
+            dataset.close()
+        self._schema(path, schema)
+        dataset.connect()
+
+    def rows(self, path, sql, *params):
+        conn = sqlite3.connect(path)
+        try:
+            return conn.execute(sql, params).fetchall()
+        finally:
+            conn.close()
+
+    def fk_violations(self, path):
+        return self.rows(path, 'PRAGMA foreign_key_check')
+
+
+class TestCopyRecords(BaseCopyTestCase):
+    def test_copies_referenced_parents(self):
+        result = copy_referenced_records(
+            self.source, self.target, 'orders', [100, 100])
+        # The duplicate selection is copied once, the customer only once.
+        self.assertEqual(result.counts, {'customers': 1, 'orders': 1})
+        self.assertEqual(result.total, 2)
+        self.assertEqual(self.rows(self.tgt_path,
+                                   'SELECT name FROM customers ORDER BY id'),
+                         [('existing',), ('acme',)])
+
+    def test_foreign_keys_point_at_new_keys(self):
+        result = copy_referenced_records(self.source, self.target, 'orders',
+                                         [100])
+        new_customer, = result.key_mapping['customers'][10],
+        new_order, = result.key_mapping['orders'][100],
+        (customer_id, code), = self.rows(
+            self.tgt_path, 'SELECT customer_id, code FROM orders '
+            'WHERE id = ?', new_order)
+        self.assertEqual((customer_id, code), (new_customer, 'A'))
+        self.assertEqual(self.fk_violations(self.tgt_path), [])
+
+    def test_null_reference_is_preserved(self):
+        result = copy_referenced_records(self.source, self.target, 'orders',
+                                         [103])
+        self.assertEqual(result.counts, {'orders': 1})
+        new_key, = result.key_mapping['orders'][103],
+        (customer_id,), = self.rows(
+            self.tgt_path, 'SELECT customer_id FROM orders WHERE id = ?',
+            new_key)
+        self.assertIsNone(customer_id)
+
+    def test_new_keys_are_generated_and_existing_rows_kept(self):
+        result = copy_referenced_records(self.source, self.target, 'customers',
+                                         [10])
+        self.assertEqual(self.rows(self.tgt_path,
+                                   'SELECT id FROM customers ORDER BY id'),
+                         [(1,), (result.key_mapping['customers'][10],)])
+        self.assertNotEqual(result.key_mapping['customers'][10], 10)
+
+    def test_identical_rows_are_not_merged(self):
+        self.rebuild('source', """
+            CREATE TABLE dup (id INTEGER PRIMARY KEY, name TEXT);
+            INSERT INTO dup VALUES (1, 'same'), (2, 'same');
+        """)
+        self.rebuild('target', """
+            CREATE TABLE dup (id INTEGER PRIMARY KEY, name TEXT);
+        """)
+        result = copy_referenced_records(
+            self.source, self.target, 'dup', [1, 2])
+        self.assertEqual(result.counts, {'dup': 2})
+        self.assertEqual(self.rows(self.tgt_path,
+                                   'SELECT name FROM dup'), [('same',),
+                                                             ('same',)])
+
+    def test_missing_reference_is_a_preflight_error(self):
+        conn = sqlite3.connect(self.src_path)
+        conn.execute('PRAGMA foreign_keys = OFF')
+        conn.execute("INSERT INTO orders (id, customer_id, code) "
+                     "VALUES (150, 999, 'dangling')")
+        conn.commit()
+        conn.close()
+        with self.assertRaises(CopyError) as ctx:
+            copy_referenced_records(self.source, self.target, 'orders', [150])
+        self.assertIn('missing referenced record', str(ctx.exception))
+        self.assertEqual(self.rows(self.tgt_path,
+                                   'SELECT COUNT(*) FROM orders'), [(0,)])
+
+    def test_missing_source_row_errors(self):
+        with self.assertRaises(CopyError):
+            copy_referenced_records(self.source, self.target, 'orders', [999])
+
+    def test_incompatible_column_type_errors(self):
+        self.rebuild('target', """
+            CREATE TABLE customers (id INTEGER PRIMARY KEY, name INTEGER);
+            CREATE TABLE orders (id INTEGER PRIMARY KEY,
+                customer_id INTEGER REFERENCES customers, code INTEGER);
+        """)
+        with self.assertRaises(CopyError) as ctx:
+            copy_referenced_records(self.source, self.target, 'orders', [100])
+        self.assertIn('incompatible structure', str(ctx.exception))
+        self.assertEqual(self.rows(self.tgt_path,
+                                   'SELECT COUNT(*) FROM orders'), [(0,)])
+
+    def test_missing_target_table_errors(self):
+        self.rebuild('target',
+                     'CREATE TABLE orders (id INTEGER PRIMARY KEY, '
+                     'customer_id INTEGER REFERENCES customers, code TEXT);')
+        with self.assertRaises(CopyError):
+            copy_referenced_records(self.source, self.target, 'orders', [100])
+
+    def test_triggered_table_errors(self):
+        conn = sqlite3.connect(self.tgt_path)
+        conn.execute('CREATE TRIGGER t AFTER INSERT ON orders '
+                     'BEGIN SELECT 1; END')
+        conn.commit()
+        conn.close()
+        with self.assertRaises(CopyError) as ctx:
+            copy_referenced_records(self.source, self.target, 'orders', [100])
+        self.assertIn('trigger', str(ctx.exception))
+
+    def test_cyclic_foreign_keys_error(self):
+        self.rebuild('source', """
+            CREATE TABLE a (id INTEGER PRIMARY KEY,
+                b_id INTEGER REFERENCES b);
+            CREATE TABLE b (id INTEGER PRIMARY KEY,
+                a_id INTEGER REFERENCES a);
+        """)
+        self.rebuild('target', """
+            CREATE TABLE a (id INTEGER PRIMARY KEY,
+                b_id INTEGER REFERENCES b);
+            CREATE TABLE b (id INTEGER PRIMARY KEY,
+                a_id INTEGER REFERENCES a);
+        """)
+        with self.assertRaises(CopyError) as ctx:
+            copy_referenced_records(self.source, self.target, 'a', [1])
+        self.assertIn('cycle', str(ctx.exception))
+
+    def test_constraint_error_rolls_back_whole_batch(self):
+        self.rebuild('target', """
+            CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT);
+            CREATE TABLE orders (id INTEGER PRIMARY KEY,
+                customer_id INTEGER REFERENCES customers,
+                code TEXT UNIQUE);
+            INSERT INTO orders (id, customer_id, code) VALUES (7, NULL, 'C');
+        """)
+        with self.assertRaises(CopyError):
+            copy_referenced_records(self.source, self.target, 'orders',
+                                    [100, 102])
+        # The parent inserted before the failure is rolled back too.
+        self.assertEqual(self.rows(self.tgt_path,
+                                   'SELECT COUNT(*) FROM customers'), [(0,)])
+        self.assertEqual(self.rows(self.tgt_path,
+                                   'SELECT id FROM orders'), [(7,)])
+
+    def test_source_is_not_modified(self):
+        before = self.rows(self.src_path, 'SELECT COUNT(*) FROM items')
+        copy_referenced_records(self.source, self.target, 'orders', [100])
+        self.assertEqual(
+            self.rows(self.src_path, 'SELECT COUNT(*) FROM items'), before)
+        self.assertEqual(
+            self.rows(self.src_path,
+                      'SELECT id, customer_id, code FROM orders ORDER BY id'),
+            [(100, 10, 'A'), (101, 11, 'B'), (102, 10, 'C'), (103, None, 'N')])
+
+    def test_same_database_is_rejected(self):
+        with self.assertRaises(CopyError):
+            copy_referenced_records(self.source, self.source, 'orders', [100])
+
+    def test_parse_keys(self):
+        self.assertEqual(parse_keys('1, 2 3'), [1, 2, 3])
+        self.assertEqual(parse_keys(['4', '5']), [4, 5])
+        self.assertEqual(parse_keys(key_encode([6])), [6])
+        with self.assertRaises(CopyError):
+            parse_keys('')
+        with self.assertRaises(CopyError):
+            parse_keys('abc')
+
+
+class TestCopyPage(BaseCopyTestCase):
+    def test_copy_tab_lists_source_rows(self):
+        # The copy tab belongs to the target (the initially selected
+        # database); the source rows are listed for selection.
+        r = self.client.get('/customers/copy/')
+        self.assertEqual(r.status_code, 200)
+        self.assertIn(b'acme', r.data)
+        self.assertIn(b'Copy rows into', r.data)
+
+    def test_copy_tab_is_absent_without_other_databases(self):
+        sw.datasets.clear()
+        sw.initialize_app([self.tgt_path])
+        client = sw.app.test_client()
+        r = client.get('/customers/')
+        self.assertNotIn(b'/customers/copy/', r.data)
+
+    def test_content_selection_redirects_to_copy_page(self):
+        self.client.get('/select-dataset/',
+                        query_string={'name': self.src_path})
+        r = self.client.post('/orders/content/', data={
+            'action': 'copy-selected',
+            'pk': [key_encode([100])],
+            'target': self.tgt_path})
+        self.assertIn(r.status_code, (302, 303))
+        location = r.headers['Location']
+        self.assertIn('/orders/copy/', location)
+        self.assertIn('keys=100', location)
+        self.assertIn(os.path.realpath(self.tgt_path), location)
+
+    def test_copy_page_preselects_keys_from_selection(self):
+        r = self.client.get('/orders/copy/', query_string={
+            'source': self.src_path,
+            'target': self.tgt_path,
+            'keys': '100,101'})
+        body = r.data.decode()
+        self.assertIn('value="100,101"', body)
+        checked = re.findall(
+            r'name="keys" type="checkbox"\s+value="(\d+)"\s+checked', body)
+        self.assertEqual(checked, ['100', '101'])
+
+    def test_copy_page_post_writes_rows_and_reports_mapping(self):
+        self.client.get('/select-dataset/',
+                        query_string={'name': self.src_path})
+        r = self.client.post('/orders/copy/', data={
+            'source': self.src_path,
+            'target': self.tgt_path,
+            'keys_text': '100,101'})
+        # Post/redirect/get: a refresh must not copy the batch again.
+        self.assertIn(r.status_code, (302, 303))
+        r = self.client.get(r.headers['Location'])
+        self.assertEqual(r.status_code, 200)
+        body = r.data.decode()
+        self.assertIn('Key mapping', body)
+        self.assertIn('Copied 4 records', body)
+        self.assertEqual(self.rows(self.tgt_path,
+                                   'SELECT COUNT(*) FROM orders'), [(2,)])
+        self.assertEqual(self.rows(self.tgt_path,
+                                   'SELECT COUNT(*) FROM customers'), [(3,)])
+        self.assertEqual(self.fk_violations(self.tgt_path), [])
+
+    def test_copy_result_page_reload_does_not_copy_again(self):
+        self.client.get('/select-dataset/',
+                        query_string={'name': self.src_path})
+        r = self.client.post('/orders/copy/', data={
+            'source': self.src_path,
+            'target': self.tgt_path,
+            'keys_text': '100'})
+        self.assertIn('Copied 2 records', self.client.get(
+            r.headers['Location']).data.decode())
+        # Reloading the result URL must not write a second batch.
+        again = self.client.get(r.headers['Location'])
+        self.assertEqual(again.status_code, 200)
+        self.assertIn('Copied 2 records', again.data.decode())
+        self.assertEqual(self.rows(self.tgt_path,
+                                   'SELECT COUNT(*) FROM orders'), [(1,)])
+        self.assertEqual(self.rows(self.tgt_path,
+                                   'SELECT COUNT(*) FROM customers'), [(2,)])
+
+    def test_copy_page_json_result(self):
+        self.client.get('/select-dataset/',
+                        query_string={'name': self.src_path})
+        r = self.client.post('/orders/copy/?format=json', data={
+            'source': self.src_path,
+            'target': self.tgt_path,
+            'keys_text': '100,101'})
+        self.assertEqual(r.status_code, 200)
+        payload = r.get_json()
+        self.assertEqual(payload['total'], 4)
+        self.assertEqual(payload['counts'], {'customers': 2, 'orders': 2})
+        self.assertEqual(payload['mapping']['orders'], {'100': 1, '101': 2})
+
+    def test_copy_page_reports_preflight_error_without_writing(self):
+        self.client.get('/select-dataset/',
+                        query_string={'name': self.src_path})
+        r = self.client.post('/orders/copy/', data={
+            'source': self.src_path,
+            'target': self.tgt_path,
+            'keys_text': 'abc'})
+        self.assertIn('invalid', r.data.decode())
+        self.assertEqual(self.rows(self.tgt_path,
+                                   'SELECT COUNT(*) FROM orders'), [(0,)])
+
+    def test_copy_requires_two_databases(self):
+        sw.datasets.clear()
+        sw.initialize_app([self.tgt_path])
+        client = sw.app.test_client()
+        r = client.get('/customers/copy/')
+        self.assertEqual(r.status_code, 200)
+        self.assertIn(b'Load another database', r.data)
+
+    def test_existing_browse_and_edit_still_work(self):
+        self.client.get('/select-dataset/',
+                        query_string={'name': self.src_path})
+        for url in ('/orders/', '/orders/content/', '/orders/query/',
+                    '/orders/insert/', '/orders/import/', '/orders/export/',
+                    '/orders/copy/'):
+            self.assertEqual(self.client.get(url).status_code, 200, url)
+        r = self.client.get('/orders/row/%s/' % key_encode([100]))
+        self.assertEqual(r.status_code, 200)
 
 
 if __name__ == '__main__':

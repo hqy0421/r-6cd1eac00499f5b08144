@@ -55,6 +55,8 @@ Then navigate to http://localhost:8080/ to view your database.
 * Import JSON or CSV files.
 * Browse table data.
 * Insert, Update or Delete rows.
+* Copy selected rows, plus the records they reference, from another loaded
+  database (see [Copying rows between databases](#copying-rows-between-databases)).
 * Load and unload databases at run-time (see `--enable-load` or `--enable-filesystem`)
 
 ### Screenshots
@@ -109,6 +111,29 @@ When configured with `--enable-load` or `--enable-filesystem` additional
 databases can be loaded or unloaded at run-time:
 
 ![](https://media.charlesleifer.com/blog/photos/sqlite-web-attach-db.png)
+
+### Copying rows between databases
+
+When more than one database is loaded, the `content` tab gains a "Copy
+Selected" action and each table a `copy` tab. A copy takes the selected rows
+and every record they reference (via foreign keys) from a source database and
+inserts them into the current or chosen target database.
+
+* Existing target rows are never overwritten; new integer primary keys are
+  generated for every copied row.
+* Foreign keys are rewritten to point at the newly-inserted records, and NULL
+  references stay NULL.
+* Selecting the same source row twice copies it once, while distinct rows with
+  identical values remain distinct records.
+* The batch runs in a single transaction. Any constraint error rolls back the
+  whole batch, and the source database is opened read-only and never modified.
+* The result page reports per-table counts and the source-key to target-key
+  mapping. `?format=json` returns the same information as JSON.
+
+Only ordinary single-column integer-primary-key tables are supported. The
+primary-key/foreign-key structure of source and target must match, and the
+reference graph must be acyclic and free of triggers; otherwise the copy is
+rejected with a preflight error before anything is written.
 
 ### Command-line options
 

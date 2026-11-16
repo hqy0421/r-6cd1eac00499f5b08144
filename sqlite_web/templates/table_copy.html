@@ -1,0 +1,138 @@
+{% extends "base_table.html" %}
+
+{% block copy_tab_class %} active{% endblock %}
+
+{% block inner_content %}
+  <h3>Copy rows into <code>{{ target.short_path }}</code></h3>
+  <p class="text-muted">
+    Rows are copied from another loaded database together with every record
+    they reference. The target generates new primary keys, foreign keys are
+    rewritten to point at the copied records, and NULL references stay NULL.
+    Existing target data is never overwritten. The whole batch is written in
+    one transaction, and the source database is only read.
+  </p>
+
+  {% if error %}
+    <div class="alert alert-danger"><strong>Copy failed:</strong> {{ error }}</div>
+  {% endif %}
+
+  {% if result and result.total %}
+    <h4>Copied {{ result.total }} record{{ '' if result.total == 1 else 's' }}</h4>
+    <table class="table table-sm table-striped w-auto">
+      <thead>
+        <tr><th>Table</th><th>Rows copied</th></tr>
+      </thead>
+      <tbody>
+        {% for entry in result.tables %}
+          <tr>
+            <td><code>{{ entry.table }}</code></td>
+            <td>{{ entry.count }}</td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    <h4>Key mapping</h4>
+    <p class="text-muted">Source primary key &rarr; new target primary key.</p>
+    <table class="table table-sm table-striped w-auto">
+      <thead>
+        <tr><th>Table</th><th>Source key</th><th>Target key</th></tr>
+      </thead>
+      <tbody>
+        {% for entry in result.tables %}
+          {% for source_key, target_key in entry.mappings %}
+            <tr>
+              <td><code>{{ entry.table }}</code></td>
+              <td><code>{{ source_key }}</code></td>
+              <td><code>{{ target_key }}</code></td>
+            </tr>
+          {% endfor %}
+        {% endfor %}
+      </tbody>
+    </table>
+    <p>
+      <a href="{{ url_for('table_content', table=table) }}">View the target table</a>
+    </p>
+    <hr />
+  {% endif %}
+
+  {% if not sources %}
+    <div class="alert alert-info">
+      Load another database first, then return to this page. The current
+      database is the copy target.
+    </div>
+  {% else %}
+    <form action="." method="get" class="form-inline mb-3">
+      <input name="target" type="hidden" value="{{ target.filename }}" />
+      <label class="mr-2" for="copy-source">Source database</label>
+      <select class="form-control form-control-sm mr-2" id="copy-source" name="source">
+        {% for name, ds in sources.items() %}
+          <option value="{{ name }}"{% if source and ds.filename == source.filename %} selected{% endif %}>{{ ds.short_path }}</option>
+        {% endfor %}
+      </select>
+      <button class="btn btn-sm btn-outline-secondary" type="submit">Load</button>
+    </form>
+
+    {% if source_rows and source_rows.error %}
+      <div class="alert alert-warning">
+        The source table cannot be listed: {{ source_rows.error }}
+      </div>
+    {% endif %}
+
+    <form action="." method="post" autocomplete="off">
+      <input name="target" type="hidden" value="{{ target.filename }}" />
+      <input name="source" type="hidden" value="{% if source %}{{ source.filename }}{% endif %}" />
+      <div class="form-row align-items-end">
+        <div class="form-group col-auto">
+          <label for="copy-keys">Primary keys
+            <small class="text-muted">(comma or space separated)</small></label>
+          <input class="form-control form-control-sm" id="copy-keys" name="keys_text"
+                 type="text" value="{{ keys_text }}" placeholder="1, 2, 3" />
+        </div>
+        <div class="form-group col-auto">
+          <button class="btn btn-sm btn-primary" type="submit">Copy</button>
+        </div>
+      </div>
+
+      {% if source_rows and not source_rows.error %}
+        <p class="text-muted">
+          Or tick rows below.
+          {% if source_rows.truncated %}
+            Showing the first {{ source_rows.rows|length }} of
+            {{ source_rows.total }} source rows; use the primary-key field
+            for the rest.
+          {% else %}
+            {{ source_rows.total }} source row{{ '' if source_rows.total == 1 else 's' }}.
+          {% endif %}
+        </p>
+        <div class="table-wrapper">
+        <table class="table table-striped table-hover table-sm small cell-content">
+          <thead>
+            <tr>
+              <th style="width:24px;"><input id="toggle-pk-all" type="checkbox" aria-label="Select all rows" /></th>
+              {% for column in source_rows.columns %}
+                <th data-col="{{ column }}">{{ column }}</th>
+              {% endfor %}
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in source_rows.rows %}
+              <tr>
+                <td>
+                  <input class="toggle-pk" name="keys" type="checkbox"
+                         value="{{ row[source_rows.pk_index] }}"
+                         {% if selected_keys and row[source_rows.pk_index] in selected_keys %}checked {% endif %}aria-label="Select row {{ row[source_rows.pk_index] }}" />
+                </td>
+                {% for value in row %}
+                  <td{% if value is number or value is none %} class="num"{% endif %}>
+                    {% if value is none %}<code>NULL</code>{% else %}{{ value|value_filter|safe }}{% endif %}
+                  </td>
+                {% endfor %}
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+        </div>
+      {% endif %}
+    </form>
+  {% endif %}
+{% endblock %}

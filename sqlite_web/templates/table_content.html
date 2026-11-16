@@ -18,6 +18,14 @@
   {% include "results.html" %}
   {% if allow_bulk %}
     <div class="float-right">
+      {% if copy_targets %}
+        <select class="form-control form-control-sm d-inline-block w-auto" name="target" aria-label="Copy target database">
+          {% for name, ds in copy_targets.items() %}
+            <option value="{{ name }}">{{ ds.short_path }}</option>
+          {% endfor %}
+        </select>
+        <button class="btn btn-sm btn-outline-primary bulk-action" disabled name="action" type="submit" value="copy-selected">Copy Selected</button>
+      {% endif %}
       <button class="btn btn-sm btn-danger bulk-action" disabled name="action" type="submit" value="bulk-delete">Bulk Delete</button>
     </div>
     </form>
